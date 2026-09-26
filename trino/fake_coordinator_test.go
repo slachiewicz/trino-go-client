@@ -31,6 +31,7 @@ type fakeCoordinator struct {
 	statement  func(w http.ResponseWriter, r *http.Request, query string)
 	downloads  map[string]http.HandlerFunc
 	heartbeat  http.HandlerFunc
+	intercept  func(w http.ResponseWriter, r *http.Request) bool
 	requests   []capturedRequest
 	acks       []string
 }
@@ -138,6 +139,14 @@ func (fc *fakeCoordinator) onHeartbeat(handler http.HandlerFunc) {
 	fc.heartbeat = handler
 }
 
+// onRequest runs hook before the fake handles a request; the fake skips a
+// request the hook answered by returning true.
+func (fc *fakeCoordinator) onRequest(hook func(w http.ResponseWriter, r *http.Request) bool) {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	fc.intercept = hook
+}
+
 // capturedRequests returns a copy of every request received so far.
 func (fc *fakeCoordinator) capturedRequests() []capturedRequest {
 	fc.mu.Lock()
@@ -163,7 +172,12 @@ func (fc *fakeCoordinator) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	})
 	heartbeat := fc.heartbeat
 	statement := fc.statement
+	intercept := fc.intercept
 	fc.mu.Unlock()
+
+	if intercept != nil && intercept(w, r) {
+		return
+	}
 
 	switch {
 	case r.Method == http.MethodHead:

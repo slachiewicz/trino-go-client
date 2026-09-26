@@ -228,7 +228,7 @@ func (d *Driver) OpenConnector(name string) (driver.Connector, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Connector{conf: conf}, nil
+	return newConnector(conf), nil
 }
 
 var (
@@ -239,7 +239,12 @@ var (
 // Connector opens connections from a Config, including the fields a DSN
 // cannot carry. Use it with sql.OpenDB.
 type Connector struct {
-	conf *Config
+	conf         *Config
+	externalAuth *externalAuthenticator
+}
+
+func newConnector(conf *Config) *Connector {
+	return &Connector{conf: conf, externalAuth: newExternalAuthenticator(conf)}
 }
 
 var _ driver.Connector = &Connector{}
@@ -259,7 +264,7 @@ func NewConnector(conf *Config) (*Connector, error) {
 	if err := c.validate(serverURL); err != nil {
 		return nil, err
 	}
-	return &Connector{conf: c}, nil
+	return newConnector(c), nil
 }
 
 func (c *Config) clone() *Config {
@@ -276,11 +281,15 @@ func (c *Config) clone() *Config {
 		cloned.HeartbeatInterval = new(time.Duration)
 		*cloned.HeartbeatInterval = *c.HeartbeatInterval
 	}
+	if c.ExternalAuthenticationTimeout != nil {
+		cloned.ExternalAuthenticationTimeout = new(time.Duration)
+		*cloned.ExternalAuthenticationTimeout = *c.ExternalAuthenticationTimeout
+	}
 	return &cloned
 }
 
 func (c *Connector) Connect(context.Context) (driver.Conn, error) {
-	return newConnFromConfig(c.conf)
+	return newConnFromConfig(c.conf, c.externalAuth)
 }
 
 func (c *Connector) Driver() driver.Driver {
@@ -316,9 +325,27 @@ type Config struct {
 	HeartbeatInterval          *time.Duration    // Interval between spooling-protocol HEAD heartbeats (optional; DSN: heartbeat_interval)
 	Roles                      map[string]string // Roles (optional)
 
+	ExternalAuthentication        bool           // Obtain a token through the server's external authentication, e.g. OAuth2, when it rejects a request (optional; DSN: externalAuthentication)
+	ExternalAuthenticationTimeout *time.Duration // Time the user has to authenticate (optional, default is 2m; DSN: externalAuthenticationTimeout)
+
 	// Fields below cannot be expressed in a DSN; pass them with NewConnector.
 
-	HTTPClient *http.Client `dsn:"-"` // Client for every request, which never follows redirects (optional)
+	HTTPClient      *http.Client    `dsn:"-"` // Client for every request, which never follows redirects (optional)
+	RedirectHandler RedirectHandler `dsn:"-"` // Sends the user to the external authentication URL (optional, default is OpenBrowser)
+	TokenCache      TokenCache      `dsn:"-"` // Keeps the external authentication token (optional, default is in memory, per Connector)
+}
+
+// connectorOnlyField names a set field that a DSN cannot carry.
+func (c *Config) connectorOnlyField() string {
+	switch {
+	case c.HTTPClient != nil:
+		return "HTTPClient"
+	case c.RedirectHandler != nil:
+		return "RedirectHandler"
+	case c.TokenCache != nil:
+		return "TokenCache"
+	}
+	return ""
 }
 
 func (c *Config) applyDefaults() {
@@ -426,6 +453,25 @@ func ParseDSN(dsn string) (*Config, error) {
 		config.HeartbeatInterval = &heartbeat
 	}
 
+	if externalAuth := query.Get(externalAuthenticationConfig); externalAuth != "" {
+		enabled, err := strconv.ParseBool(externalAuth)
+		if err != nil {
+			return nil, fmt.Errorf("invalid boolean for %s: %q", externalAuthenticationConfig, externalAuth)
+		}
+		if enabled && serverURL.Scheme != "https" {
+			return nil, errExternalAuthenticationNeedsTLS
+		}
+		config.ExternalAuthentication = enabled
+	}
+
+	if timeoutStr := query.Get(externalAuthenticationTimeoutConfig); timeoutStr != "" {
+		timeout, err := time.ParseDuration(timeoutStr)
+		if err != nil || timeout <= 0 {
+			return nil, fmt.Errorf("trino: %s must be a positive duration, got %q", externalAuthenticationTimeoutConfig, timeoutStr)
+		}
+		config.ExternalAuthenticationTimeout = &timeout
+	}
+
 	if kerberosParam := query.Get(kerberosEnabledConfig); kerberosParam != "" {
 		enabled, err := strconv.ParseBool(kerberosParam)
 		if err != nil {
@@ -492,6 +538,12 @@ func (c *Config) validate(serverURL *url.URL) error {
 	if c.KerberosEnabled && !isSSL {
 		return errors.New("trino: client configuration error, SSL must be enabled for secure env")
 	}
+	if err := c.validateExternalAuthentication(serverURL); err != nil {
+		return err
+	}
+	if c.ExternalAuthenticationTimeout != nil && *c.ExternalAuthenticationTimeout <= 0 {
+		return fmt.Errorf("trino: %s must be positive, got %s", externalAuthenticationTimeoutConfig, *c.ExternalAuthenticationTimeout)
+	}
 	if c.HeartbeatInterval != nil && *c.HeartbeatInterval <= 0 {
 		return fmt.Errorf("trino: heartbeat_interval must be positive, got %s", *c.HeartbeatInterval)
 	}
@@ -521,8 +573,8 @@ func parseMapParameter(value, paramName, entrySeparator, keyValueSeparator strin
 }
 
 func (c *Config) FormatDSN() (string, error) {
-	if c.HTTPClient != nil {
-		return "", errors.New("trino: HTTPClient cannot be expressed in a DSN, use NewConnector")
+	if name := c.connectorOnlyField(); name != "" {
+		return "", fmt.Errorf("trino: %s cannot be expressed in a DSN, use NewConnector", name)
 	}
 	c.applyDefaults()
 
@@ -555,6 +607,13 @@ func (c *Config) FormatDSN() (string, error) {
 
 	if c.ForwardAuthorizationHeader {
 		query.Add(forwardAuthorizationHeaderConfig, "true")
+	}
+
+	if c.ExternalAuthentication {
+		query.Add(externalAuthenticationConfig, "true")
+	}
+	if c.ExternalAuthenticationTimeout != nil {
+		query.Add(externalAuthenticationTimeoutConfig, c.ExternalAuthenticationTimeout.String())
 	}
 
 	if c.DisableExplicitPrepare {
@@ -638,6 +697,7 @@ type Conn struct {
 	// server reports a SET TIME ZONE and takes precedence while it lasts
 	timeZone        *time.Location
 	sessionTimeZone *time.Location
+	externalAuth    *externalAuthenticator
 }
 
 var (
@@ -707,10 +767,10 @@ func newConn(dsn string) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newConnFromConfig(conf)
+	return newConnFromConfig(conf, newExternalAuthenticator(conf))
 }
 
-func newConnFromConfig(conf *Config) (*Conn, error) {
+func newConnFromConfig(conf *Config, externalAuth *externalAuthenticator) (*Conn, error) {
 	var kerberosClient *client.Client
 
 	if conf.KerberosEnabled {
@@ -733,6 +793,9 @@ func newConnFromConfig(conf *Config) (*Conn, error) {
 	serverURL, err := url.Parse(conf.ServerURI)
 	if err != nil {
 		return nil, fmt.Errorf("trino: invalid server URL: %w", err)
+	}
+	if err := conf.validateExternalAuthentication(serverURL); err != nil {
+		return nil, err
 	}
 
 	var httpClient = http.DefaultClient
@@ -792,6 +855,7 @@ func newConnFromConfig(conf *Config) (*Conn, error) {
 		queryTimeout:               conf.QueryTimeout,
 		heartbeatInterval:          conf.HeartbeatInterval,
 		timeZone:                   timeZone,
+		externalAuth:               externalAuth,
 	}
 
 	var user string
@@ -1133,6 +1197,11 @@ func (c *Conn) newRequest(ctx context.Context, method, url string, body io.Reade
 	}
 
 	c.copyHTTPHeaders(req.Header)
+	if c.externalAuth != nil {
+		if token := c.externalAuth.cache.Token(); token != "" {
+			req.Header.Set(authorizationHeader, getAuthorization(token))
+		}
+	}
 	for k, v := range hs {
 		req.Header[k] = v
 	}
@@ -1161,6 +1230,7 @@ func (c *Conn) roundTrip(ctx context.Context, req *http.Request) (*http.Response
 	const maxDelayBetweenRequests = float64(15 * time.Second)
 	timer := time.NewTimer(0)
 	defer timer.Stop()
+	reauthenticated := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -1190,6 +1260,30 @@ func (c *Conn) roundTrip(ctx context.Context, req *http.Request) (*http.Response
 					float64(delay)*math.Phi,
 					maxDelayBetweenRequests,
 				))
+				continue
+			case http.StatusUnauthorized:
+				if c.externalAuth == nil || reauthenticated {
+					return nil, newErrQueryFailedFromResponse(resp)
+				}
+				challenge, err := parseExternalAuthChallenge(resp.Header)
+				if challenge == nil && err == nil {
+					return nil, newErrQueryFailedFromResponse(resp)
+				}
+				resp.Body.Close()
+				if err != nil {
+					return nil, &ErrQueryFailed{StatusCode: resp.StatusCode, Reason: err}
+				}
+				rejected := strings.TrimPrefix(req.Header.Get(authorizationHeader), "Bearer ")
+				token, err := c.externalAuth.authenticate(ctx, &c.httpClient, challenge, rejected)
+				if err != nil {
+					return nil, &ErrQueryFailed{StatusCode: resp.StatusCode, Reason: err}
+				}
+				if err := rewindRequestBody(req); err != nil {
+					return nil, &ErrQueryFailed{Reason: err}
+				}
+				req.Header.Set(authorizationHeader, getAuthorization(token))
+				reauthenticated = true
+				timer.Reset(0)
 				continue
 			default:
 				return nil, newErrQueryFailedFromResponse(resp)
