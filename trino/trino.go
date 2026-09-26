@@ -62,6 +62,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"net"
 	"net/http"
@@ -220,7 +221,71 @@ func (d *Driver) Open(name string) (driver.Conn, error) {
 	return newConn(name)
 }
 
-var _ driver.Driver = &Driver{}
+// OpenConnector implements driver.DriverContext, so sql.Open parses the DSN
+// once instead of for every connection.
+func (d *Driver) OpenConnector(name string) (driver.Connector, error) {
+	conf, err := ParseDSN(name)
+	if err != nil {
+		return nil, err
+	}
+	return &Connector{conf: conf}, nil
+}
+
+var (
+	_ driver.Driver        = &Driver{}
+	_ driver.DriverContext = &Driver{}
+)
+
+// Connector opens connections from a Config, including the fields a DSN
+// cannot carry. Use it with sql.OpenDB.
+type Connector struct {
+	conf *Config
+}
+
+var _ driver.Connector = &Connector{}
+
+// NewConnector validates a copy of conf; later changes to conf do not affect
+// the Connector.
+func NewConnector(conf *Config) (*Connector, error) {
+	if conf == nil {
+		return nil, errors.New("trino: nil Config")
+	}
+	c := conf.clone()
+	c.applyDefaults()
+	serverURL, err := url.Parse(c.ServerURI)
+	if err != nil {
+		return nil, fmt.Errorf("trino: invalid server URL: %w", err)
+	}
+	if err := c.validate(serverURL); err != nil {
+		return nil, err
+	}
+	return &Connector{conf: c}, nil
+}
+
+func (c *Config) clone() *Config {
+	cloned := *c
+	cloned.SessionProperties = maps.Clone(c.SessionProperties)
+	cloned.ExtraCredentials = maps.Clone(c.ExtraCredentials)
+	cloned.Roles = maps.Clone(c.Roles)
+	cloned.ClientTags = slices.Clone(c.ClientTags)
+	if c.QueryTimeout != nil {
+		cloned.QueryTimeout = new(time.Duration)
+		*cloned.QueryTimeout = *c.QueryTimeout
+	}
+	if c.HeartbeatInterval != nil {
+		cloned.HeartbeatInterval = new(time.Duration)
+		*cloned.HeartbeatInterval = *c.HeartbeatInterval
+	}
+	return &cloned
+}
+
+func (c *Connector) Connect(context.Context) (driver.Conn, error) {
+	return newConnFromConfig(c.conf)
+}
+
+func (c *Connector) Driver() driver.Driver {
+	return &Driver{}
+}
 
 // Config is a configuration that can be encoded to a DSN string.
 type Config struct {
@@ -250,6 +315,10 @@ type Config struct {
 	QueryTimeout               *time.Duration    // Configurable timeout for query (optional)
 	HeartbeatInterval          *time.Duration    // Interval between spooling-protocol HEAD heartbeats (optional; DSN: heartbeat_interval)
 	Roles                      map[string]string // Roles (optional)
+
+	// Fields below cannot be expressed in a DSN; pass them with NewConnector.
+
+	HTTPClient *http.Client `dsn:"-"` // Client for every request, which never follows redirects (optional)
 }
 
 func (c *Config) applyDefaults() {
@@ -397,6 +466,38 @@ func ParseDSN(dsn string) (*Config, error) {
 	return config, nil
 }
 
+// validate checks the settings that do not depend on DSN syntax.
+func (c *Config) validate(serverURL *url.URL) error {
+	if err := requireTLSForPassword(serverURL); err != nil {
+		return err
+	}
+	isSSL := serverURL.Scheme == "https"
+	if c.HTTPClient != nil && (c.CustomClientName != "" || c.SSLCert != "" || c.SSLCertPath != "") {
+		return errors.New("trino: client configuration error, HTTPClient cannot be combined with a custom client or a custom SSL certificate")
+	}
+	if c.CustomClientName != "" && (c.SSLCert != "" || c.SSLCertPath != "") {
+		return errors.New("trino: client configuration error, a custom client cannot be specific together with a custom SSL certificate")
+	}
+	if c.SSLCertPath != "" {
+		if !isSSL {
+			return errors.New("trino: client configuration error, SSL must be enabled to specify a custom SSL certificate file")
+		}
+		if c.SSLCert != "" {
+			return errors.New("trino: client configuration error, a custom SSL certificate file cannot be specified together with a certificate string")
+		}
+	}
+	if c.SSLCert != "" && !isSSL {
+		return errors.New("trino: client configuration error, SSL must be enabled to specify a custom SSL certificate")
+	}
+	if c.KerberosEnabled && !isSSL {
+		return errors.New("trino: client configuration error, SSL must be enabled for secure env")
+	}
+	if c.HeartbeatInterval != nil && *c.HeartbeatInterval <= 0 {
+		return fmt.Errorf("trino: heartbeat_interval must be positive, got %s", *c.HeartbeatInterval)
+	}
+	return nil
+}
+
 func requireTLSForPassword(serverURL *url.URL) error {
 	if serverURL.User == nil {
 		return nil
@@ -420,13 +521,13 @@ func parseMapParameter(value, paramName, entrySeparator, keyValueSeparator strin
 }
 
 func (c *Config) FormatDSN() (string, error) {
+	if c.HTTPClient != nil {
+		return "", errors.New("trino: HTTPClient cannot be expressed in a DSN, use NewConnector")
+	}
 	c.applyDefaults()
 
 	serverURL, err := url.Parse(c.ServerURI)
 	if err != nil {
-		return "", err
-	}
-	if err := requireTLSForPassword(serverURL); err != nil {
 		return "", err
 	}
 	var sessionkv []string
@@ -456,41 +557,21 @@ func (c *Config) FormatDSN() (string, error) {
 		query.Add(forwardAuthorizationHeaderConfig, "true")
 	}
 
-	isSSL := serverURL.Scheme == "https"
-
 	if c.DisableExplicitPrepare {
 		query.Add(explicitPrepareConfig, "false")
 	}
 
-	if c.CustomClientName != "" {
-		if c.SSLCert != "" || c.SSLCertPath != "" {
-			return "", fmt.Errorf("trino: client configuration error, a custom client cannot be specific together with a custom SSL certificate")
-		}
+	if err := c.validate(serverURL); err != nil {
+		return "", err
 	}
 	if c.SSLCertPath != "" {
-		if !isSSL {
-			return "", fmt.Errorf("trino: client configuration error, SSL must be enabled to specify a custom SSL certificate file")
-		}
-		if c.SSLCert != "" {
-			return "", fmt.Errorf("trino: client configuration error, a custom SSL certificate file cannot be specified together with a certificate string")
-		}
 		query.Add(sslCertPathConfig, c.SSLCertPath)
 	}
-
 	if c.SSLCert != "" {
-		if !isSSL {
-			return "", fmt.Errorf("trino: client configuration error, SSL must be enabled to specify a custom SSL certificate")
-		}
-		if c.SSLCertPath != "" {
-			return "", fmt.Errorf("trino: client configuration error, a custom SSL certificate string cannot be specified together with a certificate file")
-		}
 		query.Add(sslCertConfig, c.SSLCert)
 	}
 
 	if c.KerberosEnabled {
-		if !isSSL {
-			return "", fmt.Errorf("trino: client configuration error, SSL must be enabled for secure env")
-		}
 		query.Add(kerberosEnabledConfig, "true")
 		query.Add(kerberosKeytabPathConfig, c.KerberosKeytabPath)
 		query.Add(kerberosPrincipalConfig, c.KerberosPrincipal)
@@ -626,7 +707,10 @@ func newConn(dsn string) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+	return newConnFromConfig(conf)
+}
 
+func newConnFromConfig(conf *Config) (*Conn, error) {
 	var kerberosClient *client.Client
 
 	if conf.KerberosEnabled {
@@ -652,7 +736,9 @@ func newConn(dsn string) (*Conn, error) {
 	}
 
 	var httpClient = http.DefaultClient
-	if clientKey := conf.CustomClientName; clientKey != "" {
+	if conf.HTTPClient != nil {
+		httpClient = conf.HTTPClient
+	} else if clientKey := conf.CustomClientName; clientKey != "" {
 		httpClient = getCustomClient(clientKey)
 		if httpClient == nil {
 			return nil, fmt.Errorf("trino: custom client not registered: %q", clientKey)
