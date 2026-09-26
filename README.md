@@ -59,6 +59,32 @@ dsn := "http://user@localhost:8080?catalog=default&schema=test"
 db, err := sql.Open("trino", dsn)
 ```
 
+`sql.Open` returns an error for a DSN that does not parse.
+
+Settings that a DSN cannot carry, such as an `http.Client`, go in a
+`trino.Config` passed to `trino.NewConnector` and
+[`sql.OpenDB`](https://pkg.go.dev/database/sql#OpenDB):
+
+```go
+connector, err := trino.NewConnector(&trino.Config{
+	ServerURI:  "https://user@localhost:8443",
+	Catalog:    "default",
+	HTTPClient: &http.Client{Timeout: time.Minute},
+})
+if err != nil {
+	return err
+}
+db := sql.OpenDB(connector)
+```
+
+As with the default client, the driver does not follow redirects with
+`HTTPClient`, since they would carry the `X-Trino-*` headers to another host;
+only a registered `custom_client` keeps its own redirect policy. `HTTPClient`
+cannot be combined with `custom_client`, a server or client certificate, or
+`SSLVerification`; `Config.TLSConfig` builds the matching `tls.Config` for its
+transport. `Config.FormatDSN` returns an error when it is set. `NewConnector` copies the `Config`, so later changes to it
+have no effect.
+
 ### Authentication
 
 Both HTTP Basic, Kerberos, and JWT authentication are supported.
