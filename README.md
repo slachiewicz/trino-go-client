@@ -589,22 +589,30 @@ structs to the `Scan()` function:
 * `trino.NullSliceFloat64`
 * `trino.NullSliceTime`
 * `trino.NullSliceMap`
+* `trino.NullSliceRow`
 
 For two or three dimensional arrays, use `trino.NullSlice2Bool` and
 `trino.NullSlice3Bool` or equivalents for other data types.
 
-To read `ROW` values, implement the `sql.Scanner` interface in a struct. Its
-`Scan()` function receives a `[]interface{}` slice, with values of the
-following types:
-* `bool`
-* `json.Number` for any numeric Trino types
-* `[]interface{}` for Trino arrays
-* `map[string]interface{}` for Trino maps
-* `string` for other Trino types, as character, date, time, or timestamp.
+To read a `ROW` value, scan into a `trino.Row`:
 
-> [!NOTE]
-> `VARBINARY` columns are returned as base64-encoded strings when used within
-> `ROW`, `MAP`, or `ARRAY` values.
+```go
+var row trino.Row
+err := db.QueryRow("SELECT CAST(ROW(1, 'a') AS ROW(x INTEGER, y VARCHAR))").Scan(&row)
+// row.Names  == []string{"x", "y"}
+// row.Values == []interface{}{int64(1), "a"}
+```
+
+`Names` and `Values` are aligned by index; an anonymous field's name is the
+empty string. A `NULL` row scans as a `Row` with both fields `nil`. Each
+field in `Values` is converted the same way a plain column of that type
+would be, including a nested `ROW`, which converts into another `trino.Row`;
+this applies at any depth, and through `ARRAY` and `MAP` as well, so
+`ARRAY(ROW(...))` scans with `trino.NullSliceRow` and a `MAP` with `ROW`
+values holds `trino.Row` values in its `trino.NullMap.Map`. An `ARRAY` or
+`MAP` that never contains a `ROW` is unaffected: its elements keep the raw
+shape the JSON response used, as described above, including `VARBINARY`
+staying a base64-encoded string.
 
 ## Transactions
 

@@ -256,7 +256,7 @@ func TestTypeConversion(t *testing.T) {
 			want:   nil,
 		},
 		{
-			// rows return data as-is for slice scanners
+			// rows convert into a Row, field by field, the same way a plain column would
 			dataType: "row(int, varchar(1), timestamp, array(varchar(1)))",
 			rawType:  "row",
 			arguments: []typeArgument{
@@ -319,11 +319,113 @@ func TestTypeConversion(t *testing.T) {
 				"2017-07-10 01:02:03.000 UTC",
 				[]interface{}{"b"},
 			},
+			want: Row{
+				Names: []string{"", "", "", ""},
+				Values: []interface{}{
+					int64(1),
+					"a",
+					time.Date(2017, 7, 10, 1, 2, 3, 0, time.UTC),
+					[]interface{}{"b"},
+				},
+			},
+		},
+		{
+			// an unnamed field gets the empty string as its name
+			dataType: "row(varchar)",
+			rawType:  "row",
+			arguments: []typeArgument{
+				{
+					Kind: "NAMED_TYPE",
+					namedTypeSignature: namedTypeSignature{
+						TypeSignature: typeSignature{RawType: "varchar"},
+					},
+				},
+			},
+			sample: []interface{}{"a"},
+			want:   Row{Names: []string{""}, Values: []interface{}{"a"}},
+		},
+		{
+			// a ROW field can itself be a ROW
+			dataType: "row(row(integer))",
+			rawType:  "row",
+			arguments: []typeArgument{
+				{
+					Kind: "NAMED_TYPE",
+					namedTypeSignature: namedTypeSignature{
+						FieldName: rowFieldName{Name: "inner"},
+						TypeSignature: typeSignature{
+							RawType: "row",
+							Arguments: []typeArgument{
+								{
+									Kind: "NAMED_TYPE",
+									namedTypeSignature: namedTypeSignature{
+										FieldName:     rowFieldName{Name: "x"},
+										TypeSignature: typeSignature{RawType: "integer"},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			sample: []interface{}{[]interface{}{json.Number("1")}},
+			want: Row{
+				Names:  []string{"inner"},
+				Values: []interface{}{Row{Names: []string{"x"}, Values: []interface{}{int64(1)}}},
+			},
+		},
+		{
+			// a ROW inside an ARRAY, including a NULL row
+			dataType: "array(row(integer))",
+			rawType:  "array",
+			arguments: []typeArgument{
+				{
+					Kind: "TYPE",
+					typeSignature: typeSignature{
+						RawType: "row",
+						Arguments: []typeArgument{
+							{
+								Kind: "NAMED_TYPE",
+								namedTypeSignature: namedTypeSignature{
+									FieldName:     rowFieldName{Name: "x"},
+									TypeSignature: typeSignature{RawType: "integer"},
+								},
+							},
+						},
+					},
+				},
+			},
+			sample: []interface{}{[]interface{}{json.Number("1")}, nil},
 			want: []interface{}{
-				json.Number("1"),
-				"a",
-				"2017-07-10 01:02:03.000 UTC",
-				[]interface{}{"b"},
+				Row{Names: []string{"x"}, Values: []interface{}{int64(1)}},
+				nil,
+			},
+		},
+		{
+			// a ROW inside a MAP's value type
+			dataType: "map(varchar,row(integer))",
+			rawType:  "map",
+			arguments: []typeArgument{
+				{Kind: "TYPE", typeSignature: typeSignature{RawType: "varchar"}},
+				{
+					Kind: "TYPE",
+					typeSignature: typeSignature{
+						RawType: "row",
+						Arguments: []typeArgument{
+							{
+								Kind: "NAMED_TYPE",
+								namedTypeSignature: namedTypeSignature{
+									FieldName:     rowFieldName{Name: "x"},
+									TypeSignature: typeSignature{RawType: "integer"},
+								},
+							},
+						},
+					},
+				},
+			},
+			sample: map[string]interface{}{"k": []interface{}{json.Number("1")}},
+			want: map[string]interface{}{
+				"k": Row{Names: []string{"x"}, Values: []interface{}{int64(1)}},
 			},
 		},
 		{
@@ -449,6 +551,7 @@ func TestSliceTypeConversion(t *testing.T) {
 		{name: "[]float64", scanner: &NullSliceFloat64{}, depth: 1, sample: json.Number("1.0")},
 		{name: "[]time.Time", scanner: &NullSliceTime{}, depth: 1, sample: "2017-07-01"},
 		{name: "[]map[string]interface{}", scanner: &NullSliceMap{}, depth: 1, sample: map[string]interface{}{"hello": "world"}},
+		{name: "[]Row", scanner: &NullSliceRow{}, depth: 1, sample: Row{Names: []string{"x"}, Values: []interface{}{int64(1)}}},
 		{name: "[][]bool", scanner: &NullSlice2Bool{}, depth: 2, sample: true},
 		{name: "[][]string", scanner: &NullSlice2String{}, depth: 2, sample: "hello"},
 		{name: "[][]int64", scanner: &NullSlice2Int64{}, depth: 2, sample: json.Number("1")},
@@ -606,7 +709,7 @@ func TestGetScanTypeForNonStandardTypes(t *testing.T) {
 		"color":              reflect.TypeOf(sql.NullString{}),
 		"BingTile":           reflect.TypeOf(new(interface{})).Elem(),
 		"KdbTree":            reflect.TypeOf(new(interface{})).Elem(),
-		"row":                reflect.TypeOf(new(interface{})).Elem(),
+		"row":                reflect.TypeOf(Row{}),
 		"HyperLogLog":        reflect.TypeOf([]byte{}),
 		"SetDigest":          reflect.TypeOf([]byte{}),
 		"qdigest":            reflect.TypeOf([]byte{}),
@@ -619,6 +722,51 @@ func TestGetScanTypeForNonStandardTypes(t *testing.T) {
 			assert.Equal(t, want, scanType)
 		})
 	}
+}
+
+func TestGetScanTypeForRowArray(t *testing.T) {
+	t.Parallel()
+	scanType, err := getScanType([]string{"array", "row"})
+
+	require.NoError(t, err)
+	assert.Equal(t, reflect.TypeOf(NullSliceRow{}), scanType)
+}
+
+func TestRowScan(t *testing.T) {
+	t.Parallel()
+	var r Row
+
+	require.NoError(t, r.Scan(nil))
+	assert.Equal(t, Row{}, r)
+
+	want := Row{Names: []string{"x"}, Values: []interface{}{int64(1)}}
+	require.NoError(t, r.Scan(want))
+	assert.Equal(t, want, r)
+
+	require.ErrorContains(t, r.Scan("bogus"), "cannot convert bogus (string) to Row")
+}
+
+// The field count comes from the column's type, not the data, so a mismatch
+// is reported rather than silently misaligning names and values.
+func TestRowFieldCountMismatch(t *testing.T) {
+	t.Parallel()
+	converter, err := newTypeConverter("row(integer)", typeSignature{
+		RawType: "row",
+		Arguments: []typeArgument{
+			{
+				Kind: "NAMED_TYPE",
+				namedTypeSignature: namedTypeSignature{
+					FieldName:     rowFieldName{Name: "x"},
+					TypeSignature: typeSignature{RawType: "integer"},
+				},
+			},
+		},
+	}, time.Local)
+	require.NoError(t, err)
+
+	_, err = converter.ConvertValue([]interface{}{json.Number("1"), json.Number("2")})
+
+	require.ErrorContains(t, err, "row has 2 fields but its type has 1")
 }
 
 // NullTime.Scan accepts only time.Time and NullTime; anything else leaves
