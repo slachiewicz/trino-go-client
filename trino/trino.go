@@ -2698,10 +2698,8 @@ func (st *driverStmt) startHeartbeat(ctx context.Context) {
 	ticker := time.NewTicker(st.heartbeatInterval)
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
 	st.cancelHeartbeat = cancelHeartbeat
-	st.waitHeartbeat.Add(1)
 
-	go func() {
-		defer st.waitHeartbeat.Done()
+	st.waitHeartbeat.Go(func() {
 		defer ticker.Stop()
 		var currentNextURI string
 		var consecutiveFailures int
@@ -2762,7 +2760,7 @@ func (st *driverStmt) startHeartbeat(ctx context.Context) {
 				return
 			}
 		}
-	}()
+	})
 }
 
 func (st *driverStmt) startSegmentDispatcher() {
