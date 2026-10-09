@@ -145,3 +145,17 @@ func decodeTestRows(t *testing.T, columns []queryColumn, location *time.Location
 	require.NoError(t, err)
 	return decoder.decodeRows([]byte(page), 0)
 }
+
+// The server names the zone of every TIMESTAMP WITH TIME ZONE value, so only
+// zone IDs are loaded; other spellings of a zone would each stay cached.
+func TestLoadZoneAcceptsOnlyZoneIDs(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{"Europe/Warsaw", "America/Argentina/Buenos_Aires", "Etc/GMT+5", "UTC"} {
+		_, err := loadZone(name)
+		assert.NoError(t, err, name)
+	}
+	for _, name := range []string{"Europe/./Warsaw", "Europe//Warsaw", "Europe/Warsaw/", "/Europe/Warsaw", "Europe/../Europe/Warsaw", "Europe/Warsaw ", ""} {
+		_, err := loadZone(name)
+		assert.Error(t, err, name)
+	}
+}
