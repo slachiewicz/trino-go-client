@@ -3,6 +3,8 @@ package trino
 import (
 	"context"
 	"database/sql"
+	"encoding/pem"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -188,4 +190,36 @@ func TestOpenRejectsInvalidDSN(t *testing.T) {
 	t.Parallel()
 	_, err := sql.Open("trino", "://")
 	assert.Error(t, err)
+}
+
+func TestClosedConnectionsReleaseTheirIdleSockets(t *testing.T) {
+	t.Parallel()
+	var open atomic.Int32
+	fc := startFakeCoordinator(t, func(h http.Handler) *httptest.Server {
+		server := httptest.NewUnstartedServer(h)
+		server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+			switch state {
+			case http.StateNew:
+				open.Add(1)
+			case http.StateClosed, http.StateHijacked:
+				open.Add(-1)
+			}
+		}
+		server.StartTLS()
+		return server
+	})
+	certPEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: fc.server.Certificate().Raw}))
+	connector, err := NewConnector(&Config{ServerURI: fc.url(), SSLCert: certPEM})
+	require.NoError(t, err)
+	db := sql.OpenDB(connector)
+	db.SetMaxIdleConns(0)
+	for range 5 {
+		fc.respond(statementPage(), resultPage([][]any{{1}}))
+		var v int
+		require.NoError(t, db.QueryRow("SELECT 1").Scan(&v))
+	}
+	require.NoError(t, db.Close())
+
+	assert.Eventually(t, func() bool { return open.Load() == 0 }, 5*time.Second, 10*time.Millisecond,
+		"connections closed by the pool must not keep sockets open")
 }
