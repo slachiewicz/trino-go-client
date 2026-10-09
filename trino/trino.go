@@ -578,6 +578,10 @@ func ParseDSN(dsn string) (*Config, error) {
 		}
 		config.KerberosEnabled = enabled
 	}
+	// As Config.validate does for NewConnector.
+	if config.KerberosEnabled && serverURL.Scheme != "https" {
+		return nil, errors.New("trino: client configuration error, SSL must be enabled for secure env")
+	}
 
 	if kp := query.Get(kerberosKeytabPathConfig); kp != "" {
 		config.KerberosKeytabPath = kp
@@ -850,6 +854,27 @@ func validateProxyAddress(param, address string) error {
 		}
 	}
 	return fmt.Errorf("trino: %s must be host:port, got %q", param, address)
+}
+
+// sameServer reports whether u has the scheme, host and port of server; an
+// omitted port counts as the scheme's default.
+func sameServer(u, server *url.URL) bool {
+	return strings.EqualFold(u.Scheme, server.Scheme) &&
+		strings.EqualFold(u.Hostname(), server.Hostname()) &&
+		portOrDefault(u) == portOrDefault(server)
+}
+
+func portOrDefault(u *url.URL) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return "443"
+	case "http":
+		return "80"
+	}
+	return ""
 }
 
 func requireTLSForPassword(serverURL *url.URL) error {
@@ -1228,7 +1253,9 @@ func (c *Config) TLSConfig() (*tls.Config, error) {
 // and session state are cleared by ResetSession, and external authentication
 // tokens belong to the Connector, so neither makes a connection invalid.
 type Conn struct {
-	baseURL    string
+	baseURL string
+	// serverURL is the scheme and host requests are allowed to go to.
+	serverURL  *url.URL
 	auth       *url.Userinfo
 	httpClient http.Client
 	// segmentHTTPClient follows redirects, which the coordinator issues for
@@ -1414,6 +1441,7 @@ func newConnFromConfig(conf *Config, externalAuth *externalAuthenticator, client
 
 	c := &Conn{
 		baseURL:                    serverURL.Scheme + "://" + serverURL.Host,
+		serverURL:                  &url.URL{Scheme: serverURL.Scheme, Host: serverURL.Host},
 		httpClient:                 *httpClient,
 		segmentHTTPClient:          *segmentHTTPClient,
 		httpHeaders:                make(http.Header),
@@ -1893,6 +1921,12 @@ func (c *Conn) newRequest(ctx context.Context, method, url string, body io.Reade
 	if err != nil {
 		return nil, fmt.Errorf("trino: %w", err)
 	}
+	// nextUri and the heartbeat URL come from the server and carry the
+	// connection's credentials, so like a redirect they must stay on the
+	// server the connection was configured with.
+	if c.serverURL != nil && !sameServer(req.URL, c.serverURL) {
+		return nil, fmt.Errorf("trino: %s is not on the configured server %s", req.URL.Redacted(), c.baseURL)
+	}
 	req.Header.Set(userAgentHeader, userAgent)
 
 	if c.kerberosEnabled {
@@ -1916,7 +1950,9 @@ func (c *Conn) newRequest(ctx context.Context, method, url string, body io.Reade
 		req.Header[k] = v
 	}
 
-	if c.auth != nil {
+	// A per-statement Authorization header, such as a forwarded access
+	// token, takes precedence over the connection's credentials.
+	if c.auth != nil && hs.Get(authorizationHeader) == "" {
 		pass, _ := c.auth.Password()
 		req.SetBasicAuth(c.auth.Username(), pass)
 	}

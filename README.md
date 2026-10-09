@@ -147,6 +147,12 @@ follow redirects with `HTTPClient`, except for [spooled segment
 downloads](#spooling-protocol). `Config.FormatDSN` returns an error when a
 field that a DSN cannot carry is set.
 
+The driver sends the requests that follow a statement, and its heartbeats,
+only to the scheme, host and port of the configured server; a query whose
+`nextUri` points elsewhere fails. Behind a proxy that terminates TLS or
+changes the host name, set `http-server.process-forwarded=true` on the
+coordinator so that it returns URLs on the proxy's address.
+
 ### Parameters
 
 | Parameter | `Config` field | Default | Purpose |

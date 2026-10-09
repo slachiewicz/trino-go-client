@@ -1029,3 +1029,73 @@ func TestQueryFailedTruncatesLongResponseBody(t *testing.T) {
 	require.ErrorAs(t, err, &queryFailed)
 	assert.Equal(t, body[:limit]+"...", queryFailed.Reason.Error())
 }
+
+func TestNextURIOnAnotherServerIsNotFollowed(t *testing.T) {
+	t.Parallel()
+	var otherHits atomic.Int32
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		otherHits.Add(1)
+	}))
+	t.Cleanup(other.Close)
+	fc := newFakeCoordinator(t)
+	fc.onStatement(func(w http.ResponseWriter, r *http.Request, query string) {
+		_ = json.MarshalWrite(w, &stmtResponse{ID: fakeQueryID, NextURI: other.URL + "/v1/statement/elsewhere/1"})
+	})
+	db := fc.open(t, "")
+
+	rows, err := db.Query("SELECT 1")
+	if err == nil {
+		for rows.Next() {
+		}
+		err = rows.Err()
+		rows.Close()
+	}
+	assert.ErrorContains(t, err, "is not on the configured server")
+	assert.Zero(t, otherHits.Load(), "no request may reach a server the DSN does not name")
+}
+
+func TestSameServer(t *testing.T) {
+	t.Parallel()
+	server, err := url.Parse("https://Coordinator.example:443")
+	require.NoError(t, err)
+	for raw, want := range map[string]bool{
+		"https://coordinator.example/v1/statement/q/1":      true,
+		"https://coordinator.example:443/v1/statement/q/1":  true,
+		"http://coordinator.example/v1/statement/q/1":       false,
+		"https://coordinator.example:8443/v1/statement/q/1": false,
+		"https://other.example/v1/statement/q/1":            false,
+	} {
+		u, err := url.Parse(raw)
+		require.NoError(t, err)
+		assert.Equal(t, want, sameServer(u, server), raw)
+	}
+}
+
+func TestForwardedTokenTakesPrecedenceOverPassword(t *testing.T) {
+	t.Parallel()
+	fc := newFakeTLSCoordinator(t)
+	fc.respond(resultPage([][]any{{1}}))
+	conf := &Config{
+		ServerURI:                  strings.Replace(fc.url(), "https://", "https://svc:svcpass@", 1),
+		HTTPClient:                 fc.server.Client(),
+		ForwardAuthorizationHeader: true,
+	}
+	connector, err := NewConnector(conf)
+	require.NoError(t, err)
+	db := sql.OpenDB(connector)
+	t.Cleanup(func() { db.Close() })
+
+	rows, err := db.Query("SELECT 1", sql.Named("accessToken", "enduser-token"))
+	require.NoError(t, err)
+	require.NoError(t, rows.Close())
+
+	requests := fc.capturedRequests()
+	require.NotEmpty(t, requests)
+	assert.Equal(t, "Bearer enduser-token", requests[0].header.Get("Authorization"))
+}
+
+func TestKerberosDSNRequiresTLS(t *testing.T) {
+	t.Parallel()
+	_, err := ParseDSN("http://alice@127.0.0.1:1?KerberosEnabled=true&KerberosKeytabPath=/nonexistent&KerberosPrincipal=alice&KerberosRealm=EXAMPLE.COM&KerberosConfigPath=/nonexistent")
+	assert.ErrorContains(t, err, "SSL must be enabled for secure env")
+}

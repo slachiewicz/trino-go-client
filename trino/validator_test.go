@@ -6,7 +6,6 @@ import (
 	"database/sql/driver"
 	"encoding/json/v2"
 	"net/http"
-	"strings"
 	"testing"
 	"time"
 
@@ -46,12 +45,18 @@ func TestPoolKeepsHealthyConnection(t *testing.T) {
 // server and fails afterwards.
 func TestKerberosFailureAfterStatementInvalidatesConnection(t *testing.T) {
 	t.Parallel()
+	// The service ticket expires while the server handles the statement, and
+	// the KDC is unreachable, so the request for the next page fails.
+	krb5Files := newKerberosTestFiles(t, "alice")
+	// Long enough that a loaded machine still logs in and sends the
+	// statement before the ticket expires.
+	expiry := time.Now().Add(3 * time.Second)
+	writeCredentialCache(t, krb5Files.credentialCache, "alice", expiry, "krbtgt/"+testRealm, "trino/127.0.0.1")
 	fc := newFakeTLSCoordinator(t)
 	fc.onStatement(func(w http.ResponseWriter, r *http.Request, query string) {
-		nextURI := strings.Replace(fc.url(), "127.0.0.1", "localhost", 1) + "/v1/statement/" + fakeQueryID + "/1"
-		assert.NoError(t, json.MarshalWrite(w, &stmtResponse{ID: fakeQueryID, NextURI: nextURI}))
+		time.Sleep(time.Until(expiry) + 100*time.Millisecond)
+		assert.NoError(t, json.MarshalWrite(w, &stmtResponse{ID: fakeQueryID, NextURI: fc.url() + "/v1/statement/" + fakeQueryID + "/1"}))
 	})
-	krb5Files := newKerberosTestFiles(t, "alice", "trino/127.0.0.1")
 	db := openKerberos(t, fc, Config{
 		KerberosConfigPath:          krb5Files.config,
 		KerberosCredentialCachePath: krb5Files.credentialCache,
