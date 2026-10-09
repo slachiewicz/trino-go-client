@@ -823,7 +823,8 @@ in the Trino documentation for the server side.
 ### JSON web token authentication
 
 A JWT in the [`accessToken`](#accesstoken) parameter, or in `Config.AccessToken`,
-is sent as a bearer token in the `Authorization` header of every request. See
+is sent as a bearer token in the `Authorization` header of every request. It
+**requires HTTPS**; a token over `http` is an error. See
 [JWT authentication](https://trino.io/docs/current/security/jwt.html) in the
 Trino documentation for the server side.
 
@@ -930,7 +931,8 @@ A program that holds a different token for each of its users can send it with
 each query: set `forwardAuthorizationHeader=true`, or
 `Config.ForwardAuthorizationHeader`, and pass the token as the `accessToken`
 [named argument](#per-query-settings). It overrides the `AccessToken` of the
-connection for that query.
+connection for that query. Forwarding **requires HTTPS**, and an empty token is
+an error rather than falling back to the connection's credentials.
 
 ```go
 rows, err := db.Query("SELECT * FROM foobar", sql.Named("accessToken", userToken))

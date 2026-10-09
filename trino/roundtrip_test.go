@@ -726,9 +726,9 @@ func TestRoundTripCancellation(t *testing.T) {
 
 func TestTokenAuth(t *testing.T) {
 	t.Parallel()
-	fc := newFakeCoordinator(t)
+	fc := newFakeTLSCoordinator(t)
 	fc.respond(resultPage([][]any{{1}}))
-	db := fc.open(t, "?accessToken=token")
+	db := fc.openTLS(t, "?accessToken=token")
 
 	rows, err := db.Query("SELECT 1")
 	require.NoError(t, err)
@@ -820,9 +820,9 @@ func TestQueryFailure(t *testing.T) {
 
 func TestForwardAuthorizationHeader(t *testing.T) {
 	t.Parallel()
-	fc := newFakeCoordinator(t)
+	fc := newFakeTLSCoordinator(t)
 	fc.respond(resultPage([][]any{{1}}))
-	db := fc.open(t, "?forwardAuthorizationHeader=true")
+	db := fc.openTLS(t, "?forwardAuthorizationHeader=true")
 
 	rows, err := db.Query("SELECT 1", sql.Named("accessToken", "token"))
 	require.NoError(t, err)
@@ -846,10 +846,10 @@ func TestForwardAuthorizationHeaderDisabled(t *testing.T) {
 
 func TestForwardAuthorizationHeaderNonStringToken(t *testing.T) {
 	t.Parallel()
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	t.Cleanup(ts.Close)
 
-	db, err := sql.Open("trino", ts.URL+"?forwardAuthorizationHeader=true")
+	db, err := sql.Open("trino", ts.URL+"?forwardAuthorizationHeader=true&SSLCert="+url.QueryEscape(serverCertificatePEM(ts)))
 	require.NoError(t, err)
 
 	t.Cleanup(func() {
@@ -1028,4 +1028,17 @@ func TestQueryFailedTruncatesLongResponseBody(t *testing.T) {
 	var queryFailed *ErrQueryFailed
 	require.ErrorAs(t, err, &queryFailed)
 	assert.Equal(t, body[:limit]+"...", queryFailed.Reason.Error())
+}
+
+func TestForwardAuthorizationHeaderRejectsEmptyToken(t *testing.T) {
+	t.Parallel()
+	fc := newFakeTLSCoordinator(t)
+	db := fc.openTLS(t, "?forwardAuthorizationHeader=true&user=alice&password=secret")
+
+	_, err := db.Query("SELECT 1", sql.Named("accessToken", ""))
+
+	assert.ErrorContains(t, err, "must not be empty")
+	for _, request := range fc.capturedRequests() {
+		assert.False(t, request.method == http.MethodPost && request.path == "/v1/statement", "the statement must not be sent")
+	}
 }

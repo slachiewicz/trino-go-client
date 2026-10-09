@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -177,6 +178,31 @@ func (fc *fakeCoordinator) certificatePEM() string {
 func (fc *fakeCoordinator) open(t testing.TB, params string) *sql.DB {
 	t.Helper()
 	db, err := sql.Open("trino", fc.url()+params)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	return db
+}
+
+// serverCertificatePEM returns the certificate of an httptest TLS server.
+func serverCertificatePEM(s *httptest.Server) string {
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: s.Certificate().Raw}))
+}
+
+// openTLS is open for a TLS fake: it trusts the fake's certificate through
+// SSLCert. params is appended to the DSN and must start with "?" when not
+// empty.
+func (fc *fakeCoordinator) openTLS(t testing.TB, params string) *sql.DB {
+	t.Helper()
+	sep := "?"
+	if strings.HasPrefix(params, "?") {
+		sep = "&"
+		params = params[1:]
+	}
+	dsn := fc.url() + "?SSLCert=" + url.QueryEscape(fc.certificatePEM())
+	if params != "" {
+		dsn += sep + params
+	}
+	db, err := sql.Open("trino", dsn)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 	return db

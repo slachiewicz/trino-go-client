@@ -661,6 +661,10 @@ func ParseDSN(dsn string) (*Config, error) {
 		return nil, err
 	}
 
+	if err := config.requireTLSForCredentials(serverURL); err != nil {
+		return nil, err
+	}
+
 	config.applyDefaults()
 	return config, nil
 }
@@ -671,6 +675,9 @@ func (c *Config) validate(serverURL *url.URL) error {
 		return errors.New("trino: client configuration error, ServerURI must have a scheme and a host")
 	}
 	if err := requireTLSForPassword(serverURL); err != nil {
+		return err
+	}
+	if err := c.requireTLSForCredentials(serverURL); err != nil {
 		return err
 	}
 	// ParseDSN moves the DSN path into Catalog and Schema, so only a ServerURI
@@ -850,6 +857,20 @@ func validateProxyAddress(param, address string) error {
 		}
 	}
 	return fmt.Errorf("trino: %s must be host:port, got %q", param, address)
+}
+
+// requireTLSForCredentials refuses bearer tokens over a connection that is not
+// https, as the Java client does: an access token and forwarded per-statement
+// tokens are as replayable as the password requireTLSForPassword covers. Extra
+// credentials are not refused, since the Java client sends them over http too.
+func (c *Config) requireTLSForCredentials(serverURL *url.URL) error {
+	if serverURL.Scheme == "https" {
+		return nil
+	}
+	if c.AccessToken != "" || c.ForwardAuthorizationHeader {
+		return errors.New("trino: TLS/SSL is required for authentication with an access token")
+	}
+	return nil
 }
 
 func requireTLSForPassword(serverURL *url.URL) error {
@@ -2779,6 +2800,11 @@ func (st *driverStmt) exec(ctx context.Context, args []driver.NamedValue) (*stmt
 				token, ok := arg.Value.(string)
 				if !ok {
 					return nil, fmt.Errorf("trino: %s must be a string, got %T", accessTokenConfig, arg.Value)
+				}
+				// An empty token would leave the request to the connection's
+				// own credentials instead of the caller's.
+				if token == "" {
+					return nil, fmt.Errorf("trino: %s must not be empty", accessTokenConfig)
 				}
 				hs.Add(authorizationHeader, getAuthorization(token))
 				continue

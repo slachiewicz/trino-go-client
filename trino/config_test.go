@@ -391,9 +391,9 @@ func TestParseDSNToConfig(t *testing.T) {
 		config *Config
 	}{
 		{
-			name: "HTTP with custom client and full configuration",
+			name: "HTTPS with custom client and full configuration",
 			config: &Config{
-				ServerURI:                  "http://foobar@localhost:8080",
+				ServerURI:                  "https://foobar@localhost:8080",
 				Source:                     "trino-go-client",
 				Catalog:                    "test_catalog",
 				Schema:                     "test_schema",
@@ -1269,4 +1269,37 @@ func TestConfigRequiresSchemeAndHost(t *testing.T) {
 		_, err = NewConnector(config)
 		assert.ErrorContains(t, err, "ServerURI must have a scheme and a host", "ServerURI %q", serverURI)
 	}
+}
+
+func TestCredentialsRequireTLS(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		dsn    string
+		config Config
+	}{
+		{"access token", "http://localhost:8080?accessToken=token", Config{AccessToken: "token"}},
+		{"forward authorization header", "http://localhost:8080?forwardAuthorizationHeader=true", Config{ForwardAuthorizationHeader: true}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := ParseDSN(tc.dsn)
+			assert.ErrorContains(t, err, "TLS/SSL is required")
+
+			tc.config.ServerURI = "http://localhost:8080"
+			_, err = NewConnector(&tc.config)
+			assert.ErrorContains(t, err, "TLS/SSL is required")
+		})
+	}
+}
+
+// The Java client sends extra credentials over http, and a cluster without
+// authentication can still pass them to connectors.
+func TestExtraCredentialsAllowedOverHTTP(t *testing.T) {
+	t.Parallel()
+	_, err := ParseDSN("http://localhost:8080?extra_credentials=a%3Ab")
+	assert.NoError(t, err)
+	_, err = NewConnector(&Config{ServerURI: "http://localhost:8080", ExtraCredentials: map[string]string{"a": "b"}})
+	assert.NoError(t, err)
 }
