@@ -1234,3 +1234,73 @@ func TestSpoolingNamedArgumentsAreValidated(t *testing.T) {
 		})
 	}
 }
+
+// The segments of a page are queued as the caller reads rows, so a page may
+// list more segments than the queue holds.
+func TestSpoolingProtocolPageWithManySegments(t *testing.T) {
+	t.Parallel()
+	segments := func(offset, count int) []map[string]any {
+		result := make([]map[string]any, count)
+		for i := range result {
+			data := fmt.Sprintf("[[%d]]", 1000+offset+i)
+			result[i] = inlineSegment(base64.StdEncoding.EncodeToString([]byte(data)), map[string]any{
+				"rowOffset": offset + i, "segmentSize": len(data), "rowsCount": 1,
+			})
+		}
+		return result
+	}
+	within := func(t *testing.T, what string, f func()) {
+		t.Helper()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			f()
+		}()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%s did not return", what)
+		}
+	}
+
+	t.Run("first page", func(t *testing.T) {
+		t.Parallel()
+		fc := newFakeCoordinator(t)
+		fc.respond(statementPage(), spooledPage("json", segments(0, 1100)...), emptyPage())
+		db := fc.open(t, "")
+		within(t, "reading the result", func() {
+			rows, err := db.Query("SELECT 1")
+			require.NoError(t, err)
+			assert.Len(t, collectInts(t, rows), 1100)
+			assert.NoError(t, rows.Err())
+		})
+	})
+	t.Run("close before a later page is read", func(t *testing.T) {
+		t.Parallel()
+		fc := newFakeCoordinator(t)
+		fc.respond(statementPage(), spooledPage("json", segments(0, 1)...), spooledPage("json", segments(1, 1100)...), emptyPage())
+		// The last page is requested once the large one is parsed, so
+		// closing after that leaves no page request in flight for the
+		// close to cancel.
+		lastPageRequested := make(chan struct{}, 1)
+		fc.onPage(func(index int, r *http.Request) {
+			if index == 3 {
+				select {
+				case lastPageRequested <- struct{}{}:
+				default:
+				}
+			}
+		})
+		db := fc.open(t, "")
+		rows, err := db.Query("SELECT 1")
+		require.NoError(t, err)
+		require.True(t, rows.Next())
+		select {
+		case <-lastPageRequested:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the last page was not requested")
+		}
+		time.Sleep(50 * time.Millisecond)
+		within(t, "rows.Close", func() { assert.NoError(t, rows.Close()) })
+	})
+}
