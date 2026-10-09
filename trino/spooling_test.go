@@ -1,8 +1,10 @@
 package trino
 
 import (
+	"context"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"net/http"
@@ -1233,4 +1235,73 @@ func TestSpoolingNamedArgumentsAreValidated(t *testing.T) {
 			assert.Empty(t, fc.capturedRequests(), "the query must be rejected before anything is sent")
 		})
 	}
+}
+
+func inlineRows(t testing.TB, rowOffset int, values ...int) map[string]any {
+	t.Helper()
+	rows := make([][]int, len(values))
+	for i, v := range values {
+		rows[i] = []int{v}
+	}
+	data, err := json.Marshal(rows)
+	require.NoError(t, err)
+	return inlineSegment(base64.StdEncoding.EncodeToString(data), map[string]any{
+		"rowOffset": rowOffset, "segmentSize": len(data), "rowsCount": len(values),
+	})
+}
+
+// Segments whose row offsets do not follow each other fail the query rather
+// than return fewer rows or wait for a segment that never arrives.
+func TestSpoolingProtocolSegmentSequenceErrors(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		segments []map[string]any
+		wantErr  string
+	}{
+		{"duplicate offset", []map[string]any{inlineRows(t, 0, 1000), inlineRows(t, 0, 9999), inlineRows(t, 1, 1001)}, "overlaps rows already delivered"},
+		{"gap", []map[string]any{inlineRows(t, 0, 1000), inlineRows(t, 2, 1002)}, "spooled segments missing"},
+		{"first segment not at offset 0", []map[string]any{inlineRows(t, 5, 1005)}, "spooled segments missing"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fc := newFakeCoordinator(t)
+			fc.respond(statementPage(), spooledPage("json", tc.segments...), emptyPage())
+			db := fc.open(t, "")
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			rows, err := db.QueryContext(ctx, "SELECT 1", sql.Named(trinoSpoolingWorkerCount, "1"), sql.Named(trinoMaxOutOfOrdersSegments, "10"))
+			require.NoError(t, err)
+			collectInts(t, rows)
+			assert.ErrorContains(t, rows.Err(), tc.wantErr)
+			assert.NoError(t, ctx.Err(), "the query must fail rather than wait for the deadline")
+			require.NoError(t, rows.Close())
+		})
+	}
+}
+
+func TestSpoolingProtocolSegmentDownloadHonorsDeadline(t *testing.T) {
+	t.Parallel()
+	fc := newFakeCoordinator(t)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	fc.handleSegment("slow", func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	})
+	fc.respond(statementPage(), spooledPage("json", spooledSegment("slow", map[string]any{"rowOffset": 0, "segmentSize": 17})), emptyPage())
+	db := fc.open(t, "")
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	rows, err := db.QueryContext(ctx, "SELECT 1")
+	require.NoError(t, err)
+	collectInts(t, rows)
+	assert.ErrorIs(t, rows.Err(), context.DeadlineExceeded)
+	assert.Less(t, time.Since(start), 3*time.Second, "reading rows must stop at the context deadline")
 }
