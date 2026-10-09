@@ -1,6 +1,7 @@
 package trino
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/base64"
 	"errors"
@@ -487,13 +488,13 @@ func TestSpoolingProtocolSegmentErrorHandling(t *testing.T) {
 		{
 			name:           "WrongUncompressSize",
 			segment:        spooledSegment("seg", map[string]any{"uncompressedSize": 2, "rowOffset": 2, "segmentSize": 11}),
-			wantErr:        "failed to decode spooled segment at index 0: segment size mismatch: expected 11 bytes, got 29 byte",
+			wantErr:        "segment size mismatch: expected 11 bytes, got more",
 			downloadedData: mustDecodeBase64("KLUv/QQAgQAAW1sxMDAwXSxbMTAwMDFdXZfUttw="),
 		},
 		{
 			name:           "WrongCompresSize",
 			segment:        spooledSegment("seg", map[string]any{"uncompressedSize": 2, "rowOffset": 2, "segmentSize": 29}),
-			wantErr:        "decompressed size mismatch: expected 2 bytes, got 16 bytes",
+			wantErr:        "failed to decompress zstd segment at rowOffset 2: decompressed size exceeds configured limit",
 			downloadedData: mustDecodeBase64("KLUv/QQAgQAAW1sxMDAwXSxbMTAwMDFdXZfUttw="),
 		},
 		{
@@ -571,7 +572,41 @@ func TestSpoolingProtocolSegmentErrorHandling(t *testing.T) {
 		{
 			name:    "InlineWrongUncompressSize",
 			segment: inlineSegment("KLUv/QQAgQAAW1sxMDAwXSxbMTAwMDFdXZfUttw=", map[string]any{"uncompressedSize": 1, "rowOffset": 2, "segmentSize": 29}),
-			wantErr: "failed to decode spooled segment at index 0: decompressed size mismatch: expected 1 bytes, got 16 bytes",
+			wantErr: "failed to decode spooled segment at index 0: failed to decompress zstd segment at rowOffset 2: decompressed size exceeds configured limit",
+		},
+		{
+			name:    "NegativeRowsCount",
+			segment: inlineSegment("W1sxMDAwXSwgWzEwMDAxXV0=", map[string]any{"rowOffset": 0, "segmentSize": 17, "rowsCount": -1}),
+			wantErr: "negative value in segment metadata",
+		},
+		{
+			name:    "NegativeUncompressedSize",
+			segment: inlineSegment("W1sxMDAwXSwgWzEwMDAxXV0=", map[string]any{"rowOffset": 0, "segmentSize": 17, "uncompressedSize": -1}),
+			wantErr: "negative value in segment metadata",
+		},
+		{
+			// Only the decoded rows may size the result, not the count.
+			name:    "RowsCountLargerThanTheData",
+			segment: inlineSegment("W1sxMDAwXSwgWzEwMDAxXV0=", map[string]any{"rowOffset": 0, "segmentSize": 17, "rowsCount": int64(1) << 50}),
+			wantErr: "segment at rowOffset 0 has 2 rows but its metadata says 1125899906842624",
+		},
+		{
+			// A frame header that declares 4 GiB of content for a
+			// 17-byte segment with a small declared uncompressed size.
+			name:    "ZstdFrameLargerThanUncompressedSize",
+			segment: inlineSegment("KLUv/cAAAAAAAAEAAAABAAA=", map[string]any{"rowOffset": 0, "segmentSize": 17, "uncompressedSize": 17}),
+			wantErr: "failed to decompress zstd segment at rowOffset 0",
+		},
+		{
+			name:    "ZstdUncompressedSizeLargerThanPossible",
+			segment: inlineSegment("KLUv/QQAgQAAW1sxMDAwXSxbMTAwMDFdXZfUttw=", map[string]any{"uncompressedSize": int64(1) << 50, "rowOffset": 0, "segmentSize": 29}),
+			wantErr: "is not possible for a 29-byte zstd segment",
+		},
+		{
+			name:           "DownloadLongerThanSegmentSize",
+			segment:        spooledSegment("seg", map[string]any{"rowOffset": 0, "segmentSize": 4}),
+			downloadedData: bytes.Repeat([]byte(" "), 1<<20),
+			wantErr:        "segment size mismatch: expected 4 bytes, got more",
 		},
 		{
 			name:    "InlineWrongCompresSize",
