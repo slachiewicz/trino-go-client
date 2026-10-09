@@ -3675,6 +3675,17 @@ func (qr *driverRows) startOrderedSegmentStreamer() {
 				if !ok {
 					return
 				}
+				// A segment without rows has nothing to deliver or order,
+				// and Rows.Next reads the first row of every batch it
+				// receives; drop it and release its slot.
+				if len(segment.queryData) == 0 {
+					select {
+					case <-qr.stmt.segmentThrottleCh:
+					case <-qr.doneCh:
+						return
+					}
+					continue
+				}
 
 				buffer = append(buffer, segment)
 
