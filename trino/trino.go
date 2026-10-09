@@ -287,7 +287,7 @@ func NewConnector(conf *Config) (*Connector, error) {
 	c.applyDefaults()
 	serverURL, err := url.Parse(c.ServerURI)
 	if err != nil {
-		return nil, fmt.Errorf("trino: invalid server URL: %w", err)
+		return nil, fmt.Errorf("trino: invalid server URL: %w", redactURLError(err))
 	}
 	if err := c.validate(serverURL); err != nil {
 		return nil, err
@@ -417,7 +417,7 @@ func (c *Config) applyDefaults() {
 func ParseDSN(dsn string) (*Config, error) {
 	serverURL, err := url.Parse(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("invalid DSN: %w", err)
+		return nil, fmt.Errorf("invalid DSN: %w", redactURLError(err))
 	}
 	if serverURL.Scheme == "" || serverURL.Host == "" {
 		return nil, errors.New("trino: invalid DSN, expected scheme://host[:port]")
@@ -785,7 +785,7 @@ func (c *Config) validateDSNEntries() error {
 	} {
 		for _, key := range slices.Sorted(maps.Keys(parameter.entries)) {
 			if strings.Contains(key, mapKeySeparator) || strings.Contains(key, mapEntrySeparator) || strings.Contains(parameter.entries[key], mapEntrySeparator) {
-				return fmt.Errorf("trino: %s entry %q cannot be expressed in a DSN, use NewConnector", parameter.name, key)
+				return fmt.Errorf("trino: %s entry with %s cannot be expressed in a DSN, use NewConnector", parameter.name, quotedKey(parameter.name, key))
 			}
 		}
 	}
@@ -798,10 +798,10 @@ func validateMapKeys(parameter string, entries map[string]string) error {
 			return fmt.Errorf("trino: %s key is empty", parameter)
 		}
 		if i := strings.IndexAny(key, "=,"); i >= 0 {
-			return fmt.Errorf("trino: %s key %q must not contain %q", parameter, key, key[i])
+			return fmt.Errorf("trino: %s %s must not contain %q", parameter, quotedKey(parameter, key), key[i])
 		}
 		if !isASCII(key) {
-			return fmt.Errorf("trino: %s key %q contains spaces or is not printable ASCII", parameter, key)
+			return fmt.Errorf("trino: %s %s contains spaces or is not printable ASCII", parameter, quotedKey(parameter, key))
 		}
 	}
 	return nil
@@ -850,6 +850,28 @@ func validateProxyAddress(param, address string) error {
 		}
 	}
 	return fmt.Errorf("trino: %s must be host:port, got %q", param, address)
+}
+
+// redactURLError replaces a url.Error with a fixed message. A DSN can carry a
+// password and an access token, and both the error's URL and its inner
+// message quote parts of the input: a '#', '/' or '?' in a password ends the
+// host early, and the rest of the password is reported as an invalid port.
+func redactURLError(err error) error {
+	var uerr *url.Error
+	if errors.As(err, &uerr) {
+		return fmt.Errorf("%s: malformed URL; percent-encode reserved characters in the user name and password", uerr.Op)
+	}
+	return err
+}
+
+// quotedKey names a map key in an error. An extra_credentials entry written
+// with the wrong separator puts credential text into the key, so those keys
+// are not quoted.
+func quotedKey(parameter, key string) string {
+	if parameter == "extra_credentials" {
+		return "key"
+	}
+	return fmt.Sprintf("key %q", key)
 }
 
 func requireTLSForPassword(serverURL *url.URL) error {
@@ -913,10 +935,11 @@ func parsePathCatalogAndSchema(path string) (string, string, error) {
 
 func parseMapParameter(value, paramName, entrySeparator, keyValueSeparator string) (map[string]string, error) {
 	result := make(map[string]string)
-	for _, entry := range strings.Split(value, entrySeparator) {
+	for i, entry := range strings.Split(value, entrySeparator) {
 		parts := strings.SplitN(entry, keyValueSeparator, 2)
 		if len(parts) != 2 {
-			return nil, fmt.Errorf("invalid %s entry: %q", paramName, entry)
+			// The entry may hold a credential, so it is not quoted.
+			return nil, fmt.Errorf("invalid %s entry %d: missing %q separator", paramName, i+1, keyValueSeparator)
 		}
 		result[parts[0]] = parts[1]
 	}
@@ -1355,7 +1378,7 @@ func newConn(dsn string) (*Conn, error) {
 func newConnFromConfig(conf *Config, externalAuth *externalAuthenticator, clientCredentials *clientCredentialsAuthenticator) (*Conn, error) {
 	serverURL, err := url.Parse(conf.ServerURI)
 	if err != nil {
-		return nil, fmt.Errorf("trino: invalid server URL: %w", err)
+		return nil, fmt.Errorf("trino: invalid server URL: %w", redactURLError(err))
 	}
 	if err := conf.validateExternalAuthentication(serverURL); err != nil {
 		return nil, err
