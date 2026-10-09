@@ -1,6 +1,7 @@
 package trino
 
 import (
+	"cmp"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -553,13 +555,16 @@ func validateVariantValue(metadata variantMetadata, value []byte, depth int) (in
 	}
 	container := newVariantContainer(value)
 	valuesSize := size - container.valuesStart
+	if basicType == variantBasicObject {
+		if err := validateVariantObjectFields(metadata, value, container, valuesSize); err != nil {
+			return 0, err
+		}
+	}
 	for i := 0; i < container.count; i++ {
 		start := container.offset(i)
 		end := valuesSize
 		if basicType == variantBasicArray {
 			end = container.offset(i + 1)
-		} else if fieldID := int(readVariantUint(value[container.idsStart+i*container.idSize:], container.idSize)); fieldID >= metadata.size {
-			return 0, fmt.Errorf("variant field ID %d is not in the metadata dictionary of %d keys", fieldID, metadata.size)
 		}
 		if start > end || end > valuesSize {
 			return 0, fmt.Errorf("variant element %d has invalid offsets %d and %d", i, start, end)
@@ -569,6 +574,36 @@ func validateVariantValue(metadata variantMetadata, value []byte, depth int) (in
 		}
 	}
 	return size, nil
+}
+
+// validateVariantObjectFields checks the field IDs of an object and that its
+// fields' values do not overlap, before any field is validated recursively.
+// Fields may be stored in any order, but each field has its own value, so
+// without this check a chain of objects whose fields all point at one child
+// would cost 2^depth to validate and convert.
+func validateVariantObjectFields(metadata variantMetadata, value []byte, container variantContainer, valuesSize int) error {
+	ranges := make([][2]int, container.count)
+	for i := range ranges {
+		if fieldID := int(readVariantUint(value[container.idsStart+i*container.idSize:], container.idSize)); fieldID >= metadata.size {
+			return fmt.Errorf("variant field ID %d is not in the metadata dictionary of %d keys", fieldID, metadata.size)
+		}
+		start := container.offset(i)
+		if start > valuesSize {
+			return fmt.Errorf("variant element %d has invalid offsets %d and %d", i, start, valuesSize)
+		}
+		fieldSize, err := variantValueSize(value[container.valuesStart+start : container.valuesStart+valuesSize])
+		if err != nil {
+			return err
+		}
+		ranges[i] = [2]int{start, start + fieldSize}
+	}
+	slices.SortFunc(ranges, func(a, b [2]int) int { return cmp.Compare(a[0], b[0]) })
+	for i := 1; i < len(ranges); i++ {
+		if ranges[i][0] < ranges[i-1][1] {
+			return errors.New("variant object fields share their bytes")
+		}
+	}
+	return nil
 }
 
 // variantMetadata is the dictionary of object field names a value refers to
