@@ -1,7 +1,9 @@
 package trino
 
 import (
+	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -1231,6 +1233,84 @@ func TestSpoolingNamedArgumentsAreValidated(t *testing.T) {
 
 			require.EqualError(t, err, tc.wantErr)
 			assert.Empty(t, fc.capturedRequests(), "the query must be rejected before anything is sent")
+		})
+	}
+}
+
+// The progress callback belongs to the query that registered it, not to the
+// pooled connection the next caller gets.
+func TestProgressCallbackDoesNotReachTheNextCaller(t *testing.T) {
+	t.Parallel()
+	fc := newFakeCoordinator(t)
+	fc.respond(statementPage(), resultPage([][]any{{1}}), statementPage(), resultPage([][]any{{2}}))
+	db := fc.open(t, "")
+	db.SetMaxOpenConns(1)
+	updater := &recordingProgressUpdater{}
+
+	var v int
+	require.NoError(t, db.QueryRow("SELECT 1",
+		sql.Named(trinoProgressCallbackParam, updater),
+		sql.Named(trinoProgressCallbackPeriodParam, time.Millisecond)).Scan(&v))
+	updates := len(updater.failedAcks())
+	require.NoError(t, db.QueryRow("SELECT 2").Scan(&v))
+
+	assert.Len(t, updater.failedAcks(), updates, "the next caller's query must not report to the callback")
+}
+
+// A connection reset while a query's rows are still open, as a pool may do,
+// must not take the progress callback away from that query.
+func TestProgressCallbackSurvivesResetOfARunningQuery(t *testing.T) {
+	t.Parallel()
+	fc := newFakeCoordinator(t)
+	fc.respond(statementPage(), resultPage([][]any{{1}}), resultPage([][]any{{2}}))
+	db := fc.open(t, "")
+	conn, err := db.Conn(context.Background())
+	require.NoError(t, err)
+	defer conn.Close()
+	updater := &recordingProgressUpdater{}
+
+	require.NoError(t, conn.Raw(func(driverConn any) error {
+		c := driverConn.(*Conn)
+		ctx := context.Background()
+		stmt, err := c.PrepareContext(ctx, "SELECT 1")
+		require.NoError(t, err)
+		defer stmt.Close()
+		rows, err := stmt.(driver.StmtQueryContext).QueryContext(ctx, []driver.NamedValue{
+			{Name: trinoProgressCallbackParam, Value: updater},
+			{Name: trinoProgressCallbackPeriodParam, Value: time.Nanosecond},
+		})
+		require.NoError(t, err)
+		defer rows.Close()
+		dest := make([]driver.Value, 1)
+		require.NoError(t, rows.Next(dest))
+		before := len(updater.failedAcks())
+
+		require.NoError(t, c.ResetSession(ctx))
+		require.NoError(t, rows.Next(dest))
+		assert.Equal(t, int64(2), dest[0])
+		assert.Greater(t, len(updater.failedAcks()), before, "the running query must keep reporting to its callback")
+		return nil
+	}))
+}
+
+func TestProgressCallbackArgumentsOfWrongTypeReturnError(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		args    []any
+		wantErr string
+	}{
+		{"callback", []any{sql.Named(trinoProgressCallbackParam, "not an updater"), sql.Named(trinoProgressCallbackPeriodParam, time.Second)}, "must be a ProgressUpdater, got string"},
+		{"period", []any{sql.Named(trinoProgressCallbackParam, &recordingProgressUpdater{}), sql.Named(trinoProgressCallbackPeriodParam, "1s")}, "must be a time.Duration, got string"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fc := newFakeCoordinator(t)
+			fc.respond(statementPage(), resultPage([][]any{{1}}))
+
+			_, err := fc.open(t, "").Query("SELECT 1", tc.args...)
+			assert.ErrorContains(t, err, tc.wantErr)
 		})
 	}
 }
